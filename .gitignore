@@ -1,0 +1,4 @@
+# runtime artifacts (written next to the parent workspace, but just in case)
+.olk-watch-debug.log
+node_modules/
+*.log
