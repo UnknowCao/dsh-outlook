@@ -42,7 +42,10 @@
 ## 快速开始
 
 ```sh
-dsh plugin --profile web add <本仓库路径或 git url>
+# npm 短名安装（推荐）
+dsh plugin --profile web add dsh-outlook
+# 或直接从 GitHub
+dsh plugin --profile web add https://github.com/UnknowCao/dsh-outlook
 ```
 
 然后重启 profile（或依赖 `patchReload: live`）。没有第二步——不配置凭据、不注册应用、不改 Outlook 设置。
