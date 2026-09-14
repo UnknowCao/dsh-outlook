@@ -3,7 +3,7 @@
 > **在 IT 不给你 Graph API 权限的公司电脑上，让 AI 直接操作你正在用的 Outlook。**
 > 零凭据 · 零管理员权限 · 发任何东西都先问你。
 
-[![DSH Plugin](https://img.shields.io/badge/DSH-Plugin-blue)](https://www.npmjs.com/package/@deepseek-ai/dsh) [![Platform](https://img.shields.io/badge/Platform-Windows%20%2B%20classic%20Outlook-0078D4)](https://support.microsoft.com/en-us/office) [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE) [![Tools](https://img.shields.io/badge/tools-13-8A2BE2)](#它会交付什么)
+[![DSH Plugin](https://img.shields.io/badge/DSH-Plugin-blue)](https://www.npmjs.com/package/@deepseek-ai/dsh) [![Platform](https://img.shields.io/badge/Platform-Windows%20%2B%20classic%20Outlook-0078D4)](https://support.microsoft.com/en-us/office) [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE) [![Tools](https://img.shields.io/badge/tools-18-8A2BE2)](#它会交付什么)
 
 *Zero-credential Outlook automation for AI agents on Windows: drives your local desktop Outlook client via COM. No Graph API app registration, no SMTP passwords, no tenant admin rights — everything that leaves the machine passes a three-layer human approval gate.*
 
@@ -15,25 +15,30 @@
 
 ## 它会交付什么？
 
-**13 个 AI 工具**（读操作自动执行；任何外发动作必须过确认弹窗）：
+**18 个 AI 工具**（读操作自动执行；任何外发动作必须过确认弹窗）：
 
 | 工具 | 功能 | 守门 |
 |---|---|---|
 | `outlook_check_new` | 新邮件到达推送（侧边栏角标同步） | 只读 |
-| `outlook_search_mail` | 搜邮件（天数/文件夹/发件人/主题/日期区间/收件人侧） | 只读 |
+| `outlook_search_mail` | 搜邮件（天数/文件夹/发件人/主题/日期区间/收件人侧），结果可贴点击打开链接 | 只读 |
 | `outlook_read_mail` | 读全文（正文/收件人/附件名，超长截断） | 只读 |
+| `outlook_open_mail` | 在桌面 Outlook 窗口中打开邮件（标记已读、角标减 1） | 本地动作 |
 | `outlook_account` | 当前账户名/SMTP | 只读 |
 | `outlook_draft_mail` | 建草稿（**永不发送**，可带附件） | 安全 |
 | `outlook_send_mail` | 发邮件 | 三层人审 |
 | `outlook_reply_mail` | 回复/全部回复/转发（自动引用原文，转发带原附件） | 三层人审 |
 | `outlook_calendar_query` | 未来 N 天日程（含例会展开） | 只读 |
 | `outlook_calendar_create` | 个人日程直接建；带参会人则发邀请 | 邀请需人审 |
+| `outlook_meeting_requests` | 待响应的会议邀请列表 | 只读 |
+| `outlook_respond_meeting` | 接受/暂定/拒绝会议邀请 | 人审（通知组织者） |
+| `outlook_meeting_update` | 改日程/会议（组织者自动通知参会人） | 人审 |
+| `outlook_meeting_cancel` | 取消会议（通知参会人）/删个人日程 | 人审 |
 | `outlook_search_people` | 通讯录（GAL）搜人名/邮箱/别名 | 只读 |
 | `outlook_freebusy` | 同事忙闲时段（30 分钟粒度） | 只读 |
 | `outlook_search_rooms` | 会议室搜索 + 指定时段空闲检查 | 只读 |
 | `outlook_save_attachment` | 附件保存到本地（防路径穿越、不覆盖同名） | 本地写 |
 
-**外加一个侧边栏角标**：新邮件到达时 Outlook 按钮出现红色计数，点击弹层列出最新到达，悬停预览。
+**外加一个侧边栏角标**：新邮件到达时 Outlook 按钮出现红色计数，点击弹层列出最新到达；**点击弹层中的邮件可直接在 Outlook 中打开**（自动标记已读、角标减 1），悬停预览。
 
 | 展开态（外置角标） | 收起态（圆钮内红点） |
 |---|---|
@@ -80,21 +85,23 @@ dsh plugin --profile web add https://github.com/UnknowCao/dsh-outlook
 
 **它不会做的事**：不静默发送任何内容；不保存/不回传邮箱凭据（根本不接触）；草稿永不自动发送；附件保存拒绝路径穿越、拒绝覆盖已有文件。
 
-已知边界：`/olk-notify/*` 状态路由仅监听 127.0.0.1 且不校验浏览器 cookie（本机其他进程可读新邮件主题）；多标签页共享同一待读队列。
+已知边界：`/olk-notify/*` 路由仅本机可达并做同源校验（非浏览器/导航类请求与其它本机进程仍可读新邮件主题元数据）；会话内"点击打开"链接默认指向 `http://127.0.0.1:3080`（DSH 默认端口，自定义端口部署时该链接失效，`outlook_open_mail` 工具不受影响）；多标签页共享同一待读队列；用 `OLK_WATCH=0` 环境变量可关闭新邮件监听。
 
 ## 文件结构
 
 ```
-index.js          宿主半：13 个工具注册、两轮确认、内容哈希、watcher 管理、状态路由
-client.js         浏览器半：sidebar.footer.action 槽位按钮、角标、弹层（React Portal）
+index.js          宿主半：18 个工具注册、两轮确认、内容哈希、watcher 管理、状态/打开路由
+client.js         浏览器半：sidebar.footer.action 槽位按钮、角标、弹层（React Portal，点击打开）
 lib/olk.ps1       COM 桥：全部 Outlook 操作 + 令牌门 + 本地化怪癖（见文件头注释）
 lib/watch.ps1     NewMailEx 常驻监听：推送新邮件到达，崩溃 30s 自愈
 cordis.patch.yml  宿主行声明
-TESTCASES.md      33 个测试用例（链路/渲染/共存/路由/已知边界）
+TESTCASES.md      43 个测试用例（链路/渲染/共存/路由/点击打开/已知边界）
 CHANGELOG.md      版本叙事（为什么改）
 ```
 
+诊断日志：`%TEMP%\dsh-outlook-watch-debug.log`（1MB 自动截断轮转）。
+
 ## 验证与测试
 
-- 33 个用例覆盖全链路（[TESTCASES.md](./TESTCASES.md)），自动化项全部通过实测：新邮件推送→角标→清空、watcher 强杀 30s 自愈、两种确认偷换攻击拦截、路由 405/413、日志轮转截断；
+- 43 个用例覆盖全链路（[TESTCASES.md](./TESTCASES.md)），自动化项全部通过实测：新邮件推送→角标→清空、watcher 强杀 30s 自愈、两种确认偷换攻击拦截、路由 405/413、日志轮转截断、打开即已读、GBK 代码页回归；
 - COM 怪癖（Jet/DASL 双阶段过滤、Restrict 日期格式、IncludeRecurrences 的 MaxInt 计数、PS 5.1 stdin 编码）全部编码在 `lib/olk.ps1` 并经真实 Exchange 环境验证。

@@ -69,6 +69,21 @@
 - 多浏览器标签页各自轮询，共享同一服务端队列：`check_new` 被任一会话调用后所有页面角标归零；
 - 自发邮件（Send 到自己）NewMailEx 有 ~10-20s 投递延迟，属 Exchange 行为，非插件缺陷。
 
+## G. 点击打开邮件（v2.10.0）
+
+| # | 用例 | 步骤 | 预期 | 类型 |
+|---|---|---|---|---|
+| G1 | 桥 open_mail | search_mail 取 entryId 后直接跑桥 `OLK_ACTION=open_mail` | 桌面 Outlook 弹出检查器窗口，返回 `opened:true` + subject/sender（已实测通过） | [自动] |
+| G2 | 工具 | 调用 `outlook_open_mail` | 同 G1，纯本地无确认门 | [自动] |
+| G3 | 会话链接 | agent 在聊天里贴 `[打开](http://127.0.0.1:3080/olk-notify/open?entryId=…)` 并点击 | 新标签页显示"已在 Outlook 中打开 + 主题"，桌面弹出邮件窗口 | [手动] |
+| G4 | 弹层点击 | 侧边栏弹层中点击一封邮件 | POST 成功，条目立即从列表移除、角标即时减 1；桌面弹出邮件窗口 | [手动] |
+| G5 | entryId 白名单 | GET `/olk-notify/open?entryId=<script>` | 400 / "entryId 无效"，不触桥 | [自动] |
+| G6 | POST body 上限 | POST >8KB body | 413，连接关闭 | [自动] |
+| G7 | 跨域 Origin | 携带异源 Origin 头请求三个 olk-notify 路由 | 403 | [自动] |
+| G8 | GBK 代码页回归 | 在系统代码页为 GBK 的 shell 里跑桥 | 解析成功无乱码（回归：无 BOM UTF-8 曾被 PS5.1 按 ANSI 误读致整文件解析失败，已加 BOM 修复并实测通过） | [自动][回归] |
+| G9 | 打开即已读 | 打开一封 unread:true 的邮件后用 search_mail 复查 | 桥返回 `wasUnread:true`；复查该邮件 `unread:false`（已实测通过）。注意：edit 工具重写 ps1 会剥掉 BOM，改后必须重新补 BOM | [自动] |
+| G10 | 角标同步减 1 | 打开 pending 中的一封（弹层点击或会话链接） | host 从 notify.pending 移除该 entryId 且 unread--；弹层本地列表即时移除；其它标签页 ≤20s 轮询后一致 | [自动][手动] |
+
 ---
 
 ## 自动化脚本（配合 A 组用例）

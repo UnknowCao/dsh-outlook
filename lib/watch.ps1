@@ -27,11 +27,26 @@ function GetOutlook {
   }
 }
 
+# Installed-at-all gate: on machines WITHOUT classic desktop Outlook
+# (never installed, or the new UWP "New Outlook" only), don't spin in the
+# attach loop forever — emit a reason and exit code 3. index.js treats
+# exit 3 as "Outlook missing" and does not restart the watcher.
+if (-not (Test-Path 'Registry::HKEY_CLASSES_ROOT\Outlook.Application')) {
+  Emit @{ type = 'no-outlook'; message = 'classic desktop Outlook not installed (HKCR\Outlook.Application missing) - watcher disabled' }
+  exit 3
+}
+
 $outlook = GetOutlook
 $ns = $outlook.GetNamespace('MAPI')
 try { Emit @{ type = 'hello'; unread = $ns.GetDefaultFolder(6).UnReadItemCount } } catch { Emit @{ type = 'hello'; unread = $null } }
 
 Register-ObjectEvent -InputObject $outlook -EventName NewMailEx -SourceIdentifier OlkNewMail
+
+# Outlook-restart self-healing: if Outlook quits and restarts, this process
+# holds a dead COM reference — NewMailEx never fires again and idle ticks
+# start throwing. After 3 consecutive tick failures we exit; index.js
+# restarts us in 30s and GetOutlook re-attaches to the live client (H3).
+$tickFailures = 0
 
 while ($true) {
   $e = Wait-Event -SourceIdentifier OlkNewMail -Timeout 60
@@ -57,6 +72,16 @@ while ($true) {
     }
   } else {
     # Idle heartbeat: the timeout branch also keeps the unread count fresh.
-    try { Emit @{ type = 'tick'; unread = $ns.GetDefaultFolder(6).UnReadItemCount } } catch { }
+    try {
+      Emit @{ type = 'tick'; unread = $ns.GetDefaultFolder(6).UnReadItemCount }
+      $tickFailures = 0
+    } catch {
+      $tickFailures++
+      if ($tickFailures -ge 3) {
+        # COM is gone (Outlook restarted): exit so the babysitter respawns us.
+        Emit @{ type = 'dead'; reason = 'tick failed 3x - Outlook likely restarted' }
+        exit 1
+      }
+    }
   }
 }

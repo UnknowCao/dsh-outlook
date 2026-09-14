@@ -88,6 +88,9 @@ window.__ModuleLoader__.load({
         '.olk-popover{position:fixed;z-index:60;min-width:260px;max-width:360px;padding:10px 12px;border-radius:10px;background-color:var(--dsh-bg-elevated,#fff);color:inherit;box-shadow:0 8px 24px rgba(0,0,0,.18);font-size:12.5px;line-height:1.6}',
         '.olk-popover-title{font-weight:600;margin-bottom:6px}',
         '.olk-popover-hint{opacity:.65;margin-top:6px}',
+        '.olk-mailrow{display:block;width:100%;text-align:left;background:0 0;border:none;border-radius:6px;padding:4px 6px;margin:0 -6px;font:inherit;color:inherit;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;transition:background .12s ease}',
+        '.olk-mailrow:hover:not(:disabled),.olk-mailrow:focus-visible:not(:disabled){background:var(--dsw-alias-interactive-bg-hover);outline:none}',
+        '.olk-mailrow:disabled{cursor:default;opacity:.55}',
       ].join('\n')
       document.head.appendChild(style)
       return style
@@ -146,6 +149,29 @@ window.__ModuleLoader__.load({
       const n = pending.length
       const lines = pending.slice(0, 8).map((m) => '[' + (m.sender || '?') + '] ' + (m.subject || '(无主题)'))
 
+      // Click-to-open: POST the entryId to the host open-mail route, which
+      // opens the mail in a desktop Outlook inspector AND marks it read.
+      // On success the item is removed from the local list immediately —
+      // the badge count (pending length) decrements right away, matching
+      // the host-side pending-queue removal (next poll would agree).
+      const [busy, setBusy] = React.useState(false)
+      const openMail = async (entryId) => {
+        if (busy || entryId === undefined || entryId === null) return
+        setBusy(true)
+        try {
+          const res = await fetch('/olk-notify/open', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ entryId: entryId }),
+          })
+          const data = await res.json().catch(() => null)
+          if (data && data.ok) setPending((prev) => prev.filter((m) => m.entryId !== entryId))
+          else beacon('open failed: ' + ((data && data.error) || ('HTTP ' + res.status)))
+        } catch (e) {
+          beacon('open error: ' + (e && e.message))
+        } finally { setBusy(false) }
+      }
+
       // Popover: React portal to body, fixed position beside the button.
       let popover = null
       if (open) {
@@ -165,9 +191,16 @@ window.__ModuleLoader__.load({
             onClick: (ev) => ev.stopPropagation(),
           },
             React.createElement('div', { className: 'olk-popover-title', role: 'heading', 'aria-level': 2 }, '📬 新邮件（' + n + '）'),
-            pending.slice(0, 10).map((m, i) => React.createElement('div', { key: i },
+            pending.slice(0, 10).map((m, i) => React.createElement('button', {
+              key: i,
+              type: 'button',
+              className: 'olk-mailrow',
+              disabled: busy,
+              onClick: () => { openMail(m.entryId) },
+              title: '点击在 Outlook 中打开并标记已读',
+            },
               '[' + (m.sender || '?') + '] ' + (m.subject || '(无主题)') + ' · ' + (m.received || ''))),
-            React.createElement('div', { className: 'olk-popover-hint' }, '在会话里问「有什么新邮件」可读取并清空')),
+            React.createElement('div', { className: 'olk-popover-hint' }, '点击邮件可在 Outlook 中打开；在会话里问「有什么新邮件」可读取并清空')),
           document.body)
       }
 

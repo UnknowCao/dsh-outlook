@@ -33,6 +33,12 @@ try {
   try {
     $outlook = [Runtime.InteropServices.Marshal]::GetActiveObject('Outlook.Application')
   } catch {
+    # Pre-check before New-Object: on machines with only the UWP "New
+    # Outlook" (or nothing installed), ComObject creation fails with an
+    # opaque ActiveX error — give the user an actionable message instead.
+    if (-not (Test-Path 'Registry::HKEY_CLASSES_ROOT\Outlook.Application')) {
+      throw 'classic desktop Outlook not found (HKCR\Outlook.Application missing). Install the classic Win32 Outlook app and sign in; the UWP "New Outlook" does not support COM automation.'
+    }
     $outlook = New-Object -ComObject Outlook.Application
   }
   $ns = $outlook.GetNamespace('MAPI')
@@ -159,6 +165,7 @@ try {
       $out.received = if ($it.ReceivedTime) { $it.ReceivedTime.ToString('yyyy-MM-dd HH:mm') } else { $null }
       $out.to = [string]$it.To
       $out.cc = [string]$it.CC
+      $out.bcc = [string]$it.BCC
       $body = [string]$it.Body
       $maxChars = if ($args_.maxChars) { [int]$args_.maxChars } else { 8000 }
       if ($body.Length -gt $maxChars) {
@@ -174,6 +181,7 @@ try {
       $draft = $outlook.CreateItem(0)
       if ($args_.to) { $draft.To = [string]$args_.to }
       if ($args_.cc) { $draft.CC = [string]$args_.cc }
+      if ($args_.bcc) { $draft.BCC = [string]$args_.bcc }
       $draft.Subject = [string]$args_.subject
       $draft.Body = [string]$args_.body
       if ($args_.attachments) {
@@ -200,6 +208,8 @@ try {
       # moves to Sent Items, so reading after Send() returned empty strings.
       $out.subject = [string]$draft.Subject
       $out.to = [string]$draft.To
+      $out.cc = [string]$draft.CC
+      $out.bcc = [string]$draft.BCC
       try {
         $draft.Send()
       } catch {
@@ -229,12 +239,14 @@ try {
         if ($null -eq $ev) { break }
         if ($null -ne $ev.Start) {
           $events += [ordered]@{
+            entryId   = $ev.EntryID
             subject   = [string]$ev.Subject
             start     = $ev.Start.ToString('yyyy-MM-dd HH:mm')
             end       = if ($ev.End) { $ev.End.ToString('yyyy-MM-dd HH:mm') } else { $null }
             organizer = [string]$ev.Organizer
             location  = [string]$ev.Location
             busy      = [string]$ev.BusyStatus
+            isMeeting = ($ev.Recipients.Count -gt 0)
           }
         }
         $i++
@@ -262,16 +274,58 @@ try {
       $appt.End = $parsedEnd
       if ($args_.location) { $appt.Location = [string]$args_.location }
       if ($args_.body) { $appt.Body = [string]$args_.body }
+      # Recurrence: { type: daily|weekly|monthly, interval, daysOfWeek (weekly),
+      # count or until ("yyyy-MM-dd") }. Applied before Save/Send.
+      $recSummary = ''
+      if ($args_.recurrence) {
+        $rec = $args_.recurrence
+        $type = [string]$rec.type
+        $pat = $appt.GetRecurrencePattern()
+        switch ($type) {
+          'daily'    { $pat.RecurrenceType = 0 }
+          'weekly'   { $pat.RecurrenceType = 1 }
+          'monthly'  { $pat.RecurrenceType = 2 }
+          default    { throw "recurrence.type must be daily, weekly or monthly (got '$type')." }
+        }
+        $pat.Interval = if ($rec.interval) { [int]$rec.interval } else { 1 }
+        if ($type -eq 'weekly') {
+          if (-not $rec.daysOfWeek -or @($rec.daysOfWeek).Count -eq 0) { throw 'weekly recurrence requires daysOfWeek, e.g. ["Mon","Wed"].' }
+          $mask = 0
+          foreach ($d_ in @($rec.daysOfWeek)) {
+            switch ([string]$d_) {
+              'Sun' { $mask += 1 } 'Mon' { $mask += 2 } 'Tue' { $mask += 4 }
+              'Wed' { $mask += 8 } 'Thu' { $mask += 16 } 'Fri' { $mask += 32 } 'Sat' { $mask += 64 }
+              default { throw "daysOfWeek entry must be Sun/Mon/Tue/Wed/Thu/Fri/Sat (got '$d_')." }
+            }
+          }
+          $pat.DayOfWeekMask = $mask
+        }
+        if ($rec.count) { $pat.Occurrences = [int]$rec.count }
+        elseif ($rec.until) {
+          $ud = [datetime]::MinValue
+          if (-not ([datetime]::TryParseExact([string]$rec.until, 'yyyy-MM-dd', $null, [System.Globalization.DateTimeStyles]::None, [ref]$ud))) { throw 'recurrence.until must be yyyy-MM-dd.' }
+          $pat.PatternEndDate = $ud.Date
+        } else { $pat.Occurrences = 10 }  # sensible default, keeps patterns finite
+        # PS 5.1 has no if-expressions; build the summary with statements.
+        $recSummary = $type + ' x' + $pat.Interval
+        if ($type -eq 'weekly') { $recSummary += ' on ' + (@($rec.daysOfWeek) -join ',') }
+        if ($rec.count) { $recSummary += ', ' + $rec.count + 'x' }
+        elseif ($rec.until) { $recSummary += ', until ' + $rec.until }
+        else { $recSummary += ', 10x' }
+        $out.recurrence = $recSummary
+      }
       # Capture before Send()/Save(): fields may be cleared once the item
       # leaves the drafts/calendar window.
       $sentSubject = [string]$appt.Subject
-      if ($args_.recipients) {
+      $hasAttendees = ($args_.recipients -and @($args_.recipients).Count -gt 0) -or ($args_.optionalRecipients -and @($args_.optionalRecipients).Count -gt 0)
+      if ($hasAttendees) {
         # HUMAN-APPROVAL GATE: dispatching a meeting invite leaves the
         # machine — same OLK_CONFIRM token rule as send_draft.
         if (-not $env:OLK_CONFIRM -or $env:OLK_CONFIRM.Length -lt 16) {
           throw 'SEND BLOCKED: no human confirmation token (OLK_CONFIRM) — dispatching a meeting invite requires an approved in-session confirmation first.'
         }
-        foreach ($r_ in @($args_.recipients)) { $appt.Recipients.Add([string]$r_) | Out-Null }
+        foreach ($r_ in @($args_.recipients)) { $null = $appt.Recipients.Add([string]$r_); $appt.Recipients.Item($appt.Recipients.Count).Type = 1 }        # olRequired
+        foreach ($r_ in @($args_.optionalRecipients)) { $null = $appt.Recipients.Add([string]$r_); $appt.Recipients.Item($appt.Recipients.Count).Type = 2 }  # olOptional
         if (-not $appt.Recipients.ResolveAll()) {
           $unresolved = @($appt.Recipients | Where-Object { -not $_.Resolved } | ForEach-Object { $_.Name })
           throw ('cannot resolve recipient(s): ' + ($unresolved -join '; ') + ' — invite NOT sent.')
@@ -287,6 +341,125 @@ try {
       $out.created = $true
       $out.subject = $sentSubject
       $out.start = $parsedStart.ToString($fmt)
+    }
+
+    'meeting_requests' {
+      # List pending meeting-request items (Class 53) in the Inbox: invites
+      # others sent you that are still awaiting your response.
+      $folder = $ns.GetDefaultFolder(6)
+      $items = $folder.Items.Restrict("[ReceivedTime] >= '" + (Get-Date).AddDays(-30).ToString('yyyy-MM-dd HH:mm') + "'")
+      $items.Sort('ReceivedTime', $true)
+      $reqs = @()
+      $i = 1
+      while ($reqs.Count -lt 20 -and $i -le $items.Count) {
+        $it = $null
+        try { $it = $items.Item($i) } catch { break }
+        if ($null -eq $it) { break }
+        if ($it.Class -eq 53) {
+          $assoc = $null
+          try { $assoc = $it.GetAssociatedAppointment($false) } catch {}
+          $reqs += [ordered]@{
+            entryId   = $it.EntryID
+            subject   = [string]$it.Subject
+            organizer = [string]$it.SenderName
+            received  = $it.ReceivedTime.ToString('yyyy-MM-dd HH:mm')
+            when      = if ($assoc -and $assoc.Start) { $assoc.Start.ToString('yyyy-MM-dd HH:mm') + ' ~ ' + $assoc.End.ToString('yyyy-MM-dd HH:mm') } else { $null }
+            location  = if ($assoc) { [string]$assoc.Location } else { '' }
+          }
+        }
+        $i++
+      }
+      $out.meetingRequests = $reqs
+      $out.count = $reqs.Count
+    }
+
+    'respond_meeting' {
+      # HUMAN-APPROVAL GATE: responding sends a reply to the organizer.
+      if (-not $env:OLK_CONFIRM -or $env:OLK_CONFIRM.Length -lt 16) {
+        throw 'SEND BLOCKED: no human confirmation token (OLK_CONFIRM) — responding to a meeting request requires an approved in-session confirmation first.'
+      }
+      $resp = [string]$args_.response
+      $code = 0
+      switch ($resp) {
+        'accept'     { $code = 3 }  # olMeetingAccepted
+        'tentative'  { $code = 2 }  # olMeetingTentative
+        'decline'    { $code = 4 }  # olMeetingDeclined
+        default { throw "response must be accept, tentative or decline (got '$resp')." }
+      }
+      $it = $ns.GetItemFromID([string]$args_.entryId)
+      if ($it.Class -ne 53) { throw 'item is not a meeting request (Class ' + $it.Class + ').' }
+      $null = $it.Respond($code, $true, $true)  # (response, NoUI, sendResponse)
+      $out.responded = $resp
+      $out.subject = [string]$it.Subject
+      $out.message = 'Meeting ' + $resp + 'ed; response sent to organizer.'
+    }
+
+    'meeting_update' {
+      # HUMAN-APPROVAL GATE: updating an organized meeting re-notifies attendees.
+      if (-not $env:OLK_CONFIRM -or $env:OLK_CONFIRM.Length -lt 16) {
+        throw 'SEND BLOCKED: no human confirmation token (OLK_CONFIRM) — updating a meeting requires an approved in-session confirmation first.'
+      }
+      $appt = $ns.GetItemFromID([string]$args_.entryId)
+      if ($appt.Class -ne 26) { throw 'item is not an appointment (Class ' + $appt.Class + ').' }
+      # Organizer check: compare against the CURRENT user, not just "has an
+      # Organizer value" — an attendee's calendar copy also carries Organizer,
+      # and calling Send() on it would throw mid-operation (H2).
+      $me = ''
+      try { $me = [string]$ns.CurrentUser.Name } catch {}
+      $isOrganizer = ($me -ne '' -and $appt.Organizer -and (([string]$appt.Organizer).Trim() -ieq $me.Trim()) -and ($appt.Recipients.Count -gt 0))
+      $fmt = 'yyyy-MM-dd HH:mm'
+      if ($args_.start) {
+        $d = [datetime]::MinValue
+        if (-not ([datetime]::TryParseExact([string]$args_.start, $fmt, $null, [System.Globalization.DateTimeStyles]::None, [ref]$d))) { throw 'start must be yyyy-MM-dd HH:mm' }
+        $appt.Start = $d
+      }
+      if ($args_.end) {
+        $d = [datetime]::MinValue
+        if (-not ([datetime]::TryParseExact([string]$args_.end, $fmt, $null, [System.Globalization.DateTimeStyles]::None, [ref]$d))) { throw 'end must be yyyy-MM-dd HH:mm' }
+        $appt.End = $d
+      }
+      if ($args_.subject) { $appt.Subject = [string]$args_.subject }
+      if ($args_.location) { $appt.Location = [string]$args_.location }
+      if ($args_.body) { $appt.Body = [string]$args_.body }
+      $out.subject = [string]$appt.Subject
+      $out.start = $appt.Start.ToString($fmt)
+      $out.end = $appt.End.ToString($fmt)
+      $out.updated = $true
+      if ($isOrganizer) {
+        $appt.Send()  # re-notify attendees with the update
+        $out.notified = $true
+        $out.message = 'Meeting updated; attendees notified.'
+      } else {
+        $appt.Save()
+        $out.message = 'Appointment updated (no attendees to notify).'
+      }
+    }
+
+    'meeting_cancel' {
+      # HUMAN-APPROVAL GATE: cancelling notifies every attendee.
+      if (-not $env:OLK_CONFIRM -or $env:OLK_CONFIRM.Length -lt 16) {
+        throw 'SEND BLOCKED: no human confirmation token (OLK_CONFIRM) — cancelling a meeting requires an approved in-session confirmation first.'
+      }
+      $appt = $ns.GetItemFromID([string]$args_.entryId)
+      if ($appt.Class -ne 26) { throw 'item is not an appointment (Class ' + $appt.Class + ').' }
+      $out.subject = [string]$appt.Subject
+      $out.start = $appt.Start.ToString('yyyy-MM-dd HH:mm')
+      # Same organizer check as meeting_update: only the ORGANIZER may cancel
+      # with notifications; an attendee cancelling just deletes their own copy
+      # (H2 — Send() on an attendee copy throws mid-operation).
+      $me = ''
+      try { $me = [string]$ns.CurrentUser.Name } catch {}
+      $isOrganizer = ($me -ne '' -and $appt.Organizer -and (([string]$appt.Organizer).Trim() -ieq $me.Trim()) -and ($appt.Recipients.Count -gt 0))
+      if ($isOrganizer) {
+        $appt.MeetingStatus = 5  # olMeetingCanceled
+        $appt.Send()             # dispatch cancellation to attendees
+        $out.notified = $true
+        $out.message = 'Meeting cancelled; attendees notified.'
+      } else {
+        $appt.Delete()           # personal entry, or attendee removing their own copy
+        $out.message = 'Appointment deleted (no notifications sent).'
+      }
+      $out.cancelled = $true
     }
 
     'search_people' {
@@ -435,6 +608,7 @@ try {
       $out.sender = [string]$it.SenderName
       $out.to = [string]$it.To
       $out.cc = [string]$it.CC
+      $out.bcc = [string]$it.BCC
       $out.received = if ($it.ReceivedTime) { $it.ReceivedTime.ToString('yyyy-MM-dd HH:mm') } else { $null }
       $out.messageClass = [string]$it.MessageClass
     }
@@ -463,6 +637,10 @@ try {
       if ($mode -eq 'forward' -and -not $r.To) {
         throw 'forward requires a "to" recipient.'
       }
+      # Optional cc/bcc on every mode (reply-all presets cc from the
+      # original; an explicit cc/bcc overwrites the preset).
+      if ($args_.cc) { $r.CC = [string]$args_.cc }
+      if ($args_.bcc) { $r.BCC = [string]$args_.bcc }
       # Auto-quote the original below the new text (Outlook classic style).
       $origSent = if ($it.ReceivedTime) { $it.ReceivedTime.ToString('yyyy-MM-dd HH:mm') } else { '' }
       $quote = "-----Original Message-----`r`n" +
@@ -483,6 +661,8 @@ try {
       # moves to Sent Items.
       $out.subject = [string]$r.Subject
       $out.to = [string]$r.To
+      $out.cc = [string]$r.CC
+      $out.bcc = [string]$r.BCC
       $out.mode = $mode
       $r.Send()
       $out.sent = $true
@@ -514,6 +694,21 @@ try {
       $found.SaveAsFile($target)
       $out.savedPath = $target
       $out.sizeBytes = $found.Size
+    }
+
+    'open_mail' {
+      # Open one mail in a desktop Outlook inspector window. Local-only
+      # (nothing leaves the machine), so no OLK_CONFIRM gate is needed.
+      # Displaying also marks it READ: the user has now seen this mail, so
+      # badge / unread counters should stop counting it.
+      $it = $ns.GetItemFromID([string]$args_.entryId)
+      $out.subject = [string]$it.Subject
+      $out.sender = [string]$it.SenderName
+      $wasUnread = [bool]$it.UnRead
+      $it.UnRead = $false
+      $it.Display()
+      $out.opened = $true
+      $out.wasUnread = $wasUnread
     }
 
     default {

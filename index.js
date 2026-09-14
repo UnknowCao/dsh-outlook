@@ -16,15 +16,17 @@
  *
  * The bridge is invoked as
  *   powershell -NoProfile -Command "Invoke-Expression (Get-Content -Raw <olk.ps1>)"
- * because group policy commonly blocks running .ps1 files directly; arguments
- * travel via OLK_ACTION / OLK_ARGS environment variables and the result comes
- * back as one JSON object on stdout.
+ * because group policy commonly blocks running .ps1 files directly; the
+ * action name travels in the OLK_ACTION environment variable, arguments
+ * travel as ONE JSON object on STDIN (env vars cap near 32 KB), and the
+ * result comes back as one JSON object on stdout.
  * @module dsh-outlook
  */
 
 import { spawn } from 'node:child_process'
 import { createHash, randomBytes } from 'node:crypto'
-import { statSync, appendFileSync, writeFileSync, mkdirSync } from 'node:fs'
+import { statSync, appendFileSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { join, dirname } from 'node:path'
 
@@ -36,9 +38,11 @@ const BRIDGE = join(HERE, 'lib', 'olk.ps1')
 const TIMEOUT_MS = 120000
 
 /** File-backed lifecycle log for the watcher (console.warn/error are not
- *  captured by the launcher log, which hid earlier failures). Truncates at
- *  1 MB so it cannot grow unbounded. */
-const WATCH_LOG = join(HERE, '..', '.olk-watch-debug.log')
+ *  captured by the launcher log, which hid earlier failures). Lives in the
+ *  OS temp dir, NOT the plugin install dir — a global/DSH install location
+ *  can be read-only (then the log silently no-ops, which is fine for
+ *  diagnostics). Truncates at 1 MB so it cannot grow unbounded. */
+const WATCH_LOG = join(tmpdir(), 'dsh-outlook-watch-debug.log')
 const WATCH_LOG_MAX = 1024 * 1024
 function wlog(message) {
   try {
@@ -81,7 +85,7 @@ function olkOne(action, args = {}, opts = {}) {
     if (opts.confirmed) env.OLK_CONFIRM = randomBytes(24).toString('hex')
     const child = spawn('powershell', [
       '-NoProfile', '-Command',
-      `Invoke-Expression (Get-Content -Raw '${BRIDGE.replace(/'/g, "''")}')`,
+      `Invoke-Expression (Get-Content -Raw -Encoding UTF8 '${BRIDGE.replace(/'/g, "''")}')`,
     ], {
       env,
       windowsHide: true,
@@ -155,9 +159,19 @@ function contentHash(value) {
  * needs-confirmation result per kind. A confirmed:true retry whose content
  * hash differs from what was last displayed is forced back through
  * needs-confirmation — a caller can never silently swap content between
- * what the user approved and what is dispatched.
+ * what the user approved and what is dispatched. A successful dispatch
+ * consumes the hash (single-use), so the same approval cannot be replayed
+ * into a second send.
  */
 const confirmations = new Map()
+
+/** Run the confirmed dispatch and consume the approval on success, so a
+ *  replayed confirmed:true call must pass through a fresh popup. */
+async function dispatchConfirmed(kind, ...olkArgs) {
+  const result = await olk(...olkArgs)
+  if (result && result.status === 'ok') confirmations.delete(kind)
+  return result
+}
 
 /** Validate local attachment paths and render them (name + human size) for
  *  the confirmation popup. Returns { error } when a file is missing. */
@@ -213,7 +227,7 @@ function startWatcher(ctx) {
     if (stopped) return
     child = spawn('powershell', [
       '-NoProfile', '-Command',
-      `Invoke-Expression (Get-Content -Raw '${WATCH.replace(/'/g, "''")}')`,
+      `Invoke-Expression (Get-Content -Raw -Encoding UTF8 '${WATCH.replace(/'/g, "''")}')`,
     ], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
     wlog('spawned pid=' + child.pid)
     console.info('[dsh-outlook] watcher spawned (pid ' + child.pid + ')')
@@ -236,6 +250,10 @@ function startWatcher(ctx) {
             notify.pending.push({ entryId: ev.entryId, subject: ev.subject, sender: ev.sender, received: ev.received })
             if (notify.pending.length > 50) notify.pending.shift()
             console.info('[dsh-outlook] new mail: [' + ev.sender + '] ' + ev.subject)
+          } else if (ev.type === 'no-outlook') {
+            // Classic Outlook not installed on this machine: the watcher
+            // exits with code 3 right after this; do not restart it.
+            console.info('[dsh-outlook] ' + (ev.message || 'classic Outlook not installed') + ' — badge watcher disabled (tools still available if Outlook appears later via a profile restart)')
           }
         } catch { /* partial line or non-JSON noise */ }
       }
@@ -244,6 +262,12 @@ function startWatcher(ctx) {
     child.on('close', (code, signal) => {
       wlog('closed code=' + code + ' signal=' + signal + ' stopped=' + stopped)
       if (stopped) return
+      if (code === 3) {
+        // Watcher's "classic Outlook not installed" exit: no restart loop
+        // on machines without desktop Outlook (public-distribution safety).
+        console.warn('[dsh-outlook] watcher disabled: classic desktop Outlook not installed')
+        return
+      }
       console.warn('[dsh-outlook] watcher exited (code ' + code + '), restarting in 30s')
       restartTimer = setTimeout(spawnWatcher, 30000)
     })
@@ -276,11 +300,24 @@ export function apply(ctx) {
   // NewMailEx push watcher + badge state route (opt out with OLK_WATCH=0).
   startWatcher(ctx)
   ctx.inject(['webServer'], (webCtx) => {
+    // Same-origin guard for the two badge routes (M3): mail metadata must
+    // not be readable by random pages probing localhost. Non-browser
+    // clients (no Origin header) stay allowed — same trust as before.
+    const sameOrigin = (req) => {
+      const origin = req.headers.origin
+      if (origin === undefined) return true
+      try {
+        return new URL(origin).host === req.headers.host
+      } catch {
+        return false
+      }
+    }
     ctx.effect(() => webCtx.webServer.register({
       kind: 'exact',
       path: '/olk-notify/api/state',
       handler: async (req, res) => {
         if (req.method !== 'GET') { res.statusCode = 405; res.end(); return }
+        if (!sameOrigin(req)) { res.statusCode = 403; res.end(); return }
         res.setHeader('Content-Type', 'application/json; charset=utf-8')
         res.end(JSON.stringify({
           ok: true,
@@ -290,11 +327,77 @@ export function apply(ctx) {
         }))
       },
     }), 'dsh-outlook: badge state route')
+    // Click-to-open route: GET serves the chat-surface markdown link
+    // (/olk-notify/open?entryId=... — browser navigation carries no Origin
+    // header, same trust as above); POST serves the sidebar popover. Both
+    // open the mail in a desktop Outlook inspector via the open_mail
+    // bridge action (local window, nothing leaves the machine).
+    const ENTRY_ID_RE = /^[A-Za-z0-9+/=_-]{20,512}$/
+    const readEntryId = (q) => {
+      const id = String(q || '')
+      return ENTRY_ID_RE.test(id) ? id : null
+    }
+    const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]))
+    const openPage = (res, ok, message, subject) => {
+      res.statusCode = ok ? 200 : 500
+      res.setHeader('Content-Type', 'text/html; charset=utf-8')
+      res.end('<!doctype html><meta charset="utf-8"><title>Outlook</title>' +
+        '<body style="font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;color:#222">' +
+        '<div style="text-align:center"><div style="font-size:40px">' + (ok ? '📨' : '⚠️') + '</div>' +
+        '<p>' + esc(message) + (subject ? '<br><b>' + esc(subject) + '</b>' : '') + '</p>' +
+        (ok ? '<p style="opacity:.6">此页面可关闭</p>' : '') + '</div></body>')
+    }
+    ctx.effect(() => webCtx.webServer.register({
+      kind: 'exact',
+      path: '/olk-notify/open',
+      handler: async (req, res) => {
+        if (req.method !== 'GET' && req.method !== 'POST') { res.statusCode = 405; res.end(); return }
+        if (!sameOrigin(req)) { res.statusCode = 403; res.end(); return }
+        let entryId = null
+        let json = false
+        if (req.method === 'GET') {
+          const u = new URL(req.url, 'http://localhost')
+          entryId = readEntryId(u.searchParams.get('entryId'))
+        } else {
+          json = true
+          let body = ''
+          let overflow = false
+          for await (const chunk of req) {
+            body += chunk
+            if (body.length > 8192) { overflow = true; break }
+          }
+          if (overflow) { res.statusCode = 413; res.end(); return }
+          try { entryId = readEntryId(JSON.parse(body).entryId) } catch { entryId = null }
+        }
+        if (entryId === null) {
+          if (json) { res.statusCode = 400; res.setHeader('Content-Type', 'application/json; charset=utf-8'); res.end(JSON.stringify({ ok: false, error: 'invalid entryId' })) }
+          else openPage(res, false, 'entryId 无效')
+          return
+        }
+        const r = await olk('open_mail', { entryId })
+        if (r.status === 'ok') {
+          // Reading by opening: drop the mail from the pending queue (badge
+          // count = pending length, so the sidebar chip decrements on the
+          // next poll) and keep the unread total in step when the mail was
+          // previously unread.
+          const i = notify.pending.findIndex((m) => m.entryId === entryId)
+          if (i >= 0) notify.pending.splice(i, 1)
+          if (r.wasUnread && typeof notify.unread === 'number' && notify.unread > 0) notify.unread--
+        }
+        if (json) {
+          res.setHeader('Content-Type', 'application/json; charset=utf-8')
+          res.statusCode = r.status === 'ok' ? 200 : 500
+          res.end(JSON.stringify({ ok: r.status === 'ok', subject: r.subject, sender: r.sender, error: r.error }))
+        } else if (r.status === 'ok') openPage(res, true, '已在 Outlook 中打开', r.subject)
+        else openPage(res, false, '打开失败：' + (r.error || 'unknown'))
+      },
+    }), 'dsh-outlook: open-mail route')
     ctx.effect(() => webCtx.webServer.register({
       kind: 'exact',
       path: '/olk-notify/api/client-log',
       handler: async (req, res) => {
         if (req.method !== 'POST') { res.statusCode = 405; res.end(); return }
+        if (!sameOrigin(req)) { res.statusCode = 403; res.end(); return }
         let body = ''
         let overflow = false
         for await (const chunk of req) {
@@ -325,8 +428,27 @@ export function apply(ctx) {
   })
 
   ctx.tools.register({
+    name: 'outlook_open_mail',
+    description: 'Open one email in a desktop Outlook inspector window by entryId (from outlook_search_mail / outlook_check_new). Local action: nothing leaves the machine, no confirmation needed. When presenting search results in chat, prefer composing a clickable markdown link per mail, e.g. [在Outlook打开](http://127.0.0.1:3080/olk-notify/open?entryId=<entryId>) — the user can click it to open the mail directly.',
+    parameters: {
+      type: 'object',
+      additionalProperties: true,
+      properties: {
+        entryId: { type: 'string', description: 'entryId from outlook_search_mail or outlook_check_new.' },
+      },
+      required: ['entryId'],
+    },
+    output: {
+      schema: { type: 'object', additionalProperties: true },
+      render: (_a, v) => [{ type: 'text', text: JSON.stringify(v) }],
+    },
+    async execute(a) { return olk('open_mail', a) },
+    presentCall: (a) => ({ card: 'generic', title: 'Open Outlook mail', kind: 'other', rawInput: { entryId: a.entryId } }),
+  })
+
+  ctx.tools.register({
     name: 'outlook_search_mail',
-    description: 'Search emails in the local Outlook mailbox (read-only). Default: last 14 days of Inbox, newest first. Supports arbitrary folder paths ("Inbox/ProjectA", "已发送"), recipient-side matching (to), and exact date ranges (dateFrom/dateTo override days). Returns entryId values usable with outlook_read_mail.',
+    description: 'Search emails in the local Outlook mailbox (read-only). Default: last 14 days of Inbox, newest first. Supports arbitrary folder paths ("Inbox/ProjectA", "已发送"), recipient-side matching (to), and exact date ranges (dateFrom/dateTo override days). Returns entryId values usable with outlook_read_mail. Tip: when listing results to the user, append a clickable open link per mail: [打开](http://127.0.0.1:3080/olk-notify/open?entryId=<entryId>).',
     parameters: {
       type: 'object',
       additionalProperties: true,
@@ -378,6 +500,7 @@ export function apply(ctx) {
       properties: {
         to: { type: 'string', description: 'To recipients, semicolon-separated.' },
         cc: { type: 'string', description: 'Cc recipients, semicolon-separated.' },
+        bcc: { type: 'string', description: 'Bcc (blind carbon copy) recipients, semicolon-separated.' },
         subject: { type: 'string', description: 'Email subject.' },
         body: { type: 'string', description: 'Plain-text body.' },
         attachments: { type: 'array', items: { type: 'string' }, description: 'Optional local file paths to attach.' },
@@ -401,6 +524,7 @@ export function apply(ctx) {
       properties: {
         to: { type: 'string', description: 'To recipients, semicolon-separated.' },
         cc: { type: 'string', description: 'Cc recipients, semicolon-separated.' },
+        bcc: { type: 'string', description: 'Bcc (blind carbon copy) recipients, semicolon-separated; hidden from other recipients.' },
         subject: { type: 'string', description: 'Email subject.' },
         body: { type: 'string', description: 'Plain-text body.' },
         attachments: { type: 'array', items: { type: 'string' }, description: 'Optional local file paths to attach; shown in the confirmation popup.' },
@@ -416,7 +540,7 @@ export function apply(ctx) {
       // Content binding: the confirmed retry must carry EXACTLY the content
       // of the last needs-confirmation the user saw (see `confirmations`).
       const content = {
-        to: a.to, cc: a.cc || '', subject: a.subject, body: String(a.body),
+        to: a.to, cc: a.cc || '', bcc: a.bcc || '', subject: a.subject, body: String(a.body),
         attachments: Array.isArray(a.attachments) ? a.attachments : [],
       }
       const h = contentHash(content)
@@ -426,21 +550,21 @@ export function apply(ctx) {
         if (att.error) return { status: 'error', error: att.error }
         confirmations.set('send-mail', h)
         return needsConfirmation('send-mail',
-          '收件人: ' + a.to + (a.cc ? '\n抄送: ' + a.cc : '') + '\n主题: ' + a.subject
+          '收件人: ' + a.to + (a.cc ? '\n抄送: ' + a.cc : '') + (a.bcc ? '\n密送: ' + a.bcc : '') + '\n主题: ' + a.subject
           + (att.lines ? '\n附件: ' + att.lines : '')
           + '\n\n正文:\n' + String(a.body),
-          ['to', 'cc', 'subject', 'body'])
+          ['to', 'cc', 'bcc', 'subject', 'body'])
       }
       const draft = await olk('draft_mail', a)
       if (draft.status !== 'ok') return draft
-      return olk('send_draft', { entryId: draft.draftEntryId }, { confirmed: true })
+      return dispatchConfirmed('send-mail', 'send_draft', { entryId: draft.draftEntryId }, { confirmed: true })
     },
     presentCall: (a) => ({ card: 'generic', title: 'Send Outlook mail (asks first)', kind: 'other', rawInput: { to: a.to, subject: a.subject } }),
   })
 
   ctx.tools.register({
     name: 'outlook_calendar_query',
-    description: 'List calendar events for the next N days (default 7) from the local Outlook client. Read-only.',
+    description: 'List calendar events for the next N days (default 7) from the local Outlook client. Each event carries an entryId usable with outlook_meeting_update / outlook_meeting_cancel, plus an isMeeting flag. Read-only.',
     parameters: {
       type: 'object',
       additionalProperties: true,
@@ -458,7 +582,7 @@ export function apply(ctx) {
 
   ctx.tools.register({
     name: 'outlook_calendar_create',
-    description: 'Create a calendar entry in Outlook. Personal entries (no recipients) are created directly. With attendees it becomes a meeting invite and uses TWO-CALL CONFIRMATION with EDITABLE popup: the first call returns needs-confirmation; the user may allow as-is, edit fields (subject/location/body), or reject. Edited content gets one more confirmation before confirmed:true dispatches the invite.',
+    description: 'Create a calendar entry in Outlook. Personal entries (no attendees) are created directly. With attendees (required recipients or optionalRecipients) it becomes a meeting invite and uses TWO-CALL CONFIRMATION with EDITABLE popup: the first call returns needs-confirmation; the user may allow as-is, edit fields (subject/location/body), or reject. Supports recurring meetings via the recurrence object (daily/weekly/monthly).',
     parameters: {
       type: 'object',
       additionalProperties: true,
@@ -468,7 +592,9 @@ export function apply(ctx) {
         end: { type: 'string', description: 'End time, "yyyy-MM-dd HH:mm" (24h).' },
         location: { type: 'string', description: 'Location text.' },
         body: { type: 'string', description: 'Plain-text notes/body.' },
-        recipients: { type: 'array', items: { type: 'string' }, description: 'Optional attendee SMTP addresses; adding any turns this into a meeting invite (requires user confirmation).' },
+        recipients: { type: 'array', items: { type: 'string' }, description: 'Required attendee SMTP addresses; adding any (or optionalRecipients) turns this into a meeting invite (requires user confirmation).' },
+        optionalRecipients: { type: 'array', items: { type: 'string' }, description: 'Optional attendees (marked optional in the invite).' },
+        recurrence: { type: 'object', additionalProperties: true, description: 'Optional recurrence: { type: "daily"|"weekly"|"monthly", interval: n, daysOfWeek: ["Mon","Wed"...] (weekly), count: n | until: "yyyy-MM-dd" }. Defaults to 10 occurrences if neither count nor until is given.' },
         confirmed: { type: 'boolean', description: 'Set true ONLY after the user approved the invite via an in-session popup. Ignored for personal entries.' },
       },
       required: ['subject', 'start', 'end'],
@@ -478,26 +604,151 @@ export function apply(ctx) {
       render: (_a, v) => [{ type: 'text', text: JSON.stringify(v) }],
     },
     async execute(a) {
-      const hasRecipients = Array.isArray(a.recipients) && a.recipients.length > 0
+      const required = Array.isArray(a.recipients) ? a.recipients : []
+      const optional = Array.isArray(a.optionalRecipients) ? a.optionalRecipients : []
+      const hasRecipients = required.length > 0 || optional.length > 0
+      const rec = a.recurrence || null
       const content = {
         subject: a.subject, start: a.start, end: a.end,
         location: a.location || '', body: String(a.body || ''),
-        recipients: Array.isArray(a.recipients) ? a.recipients : [],
+        recipients: required, optionalRecipients: optional,
+        recurrence: rec ? JSON.stringify(rec) : '',
       }
       const h = contentHash(content)
       if ((hasRecipients && a.confirmed !== true) || (hasRecipients && confirmations.get('calendar-invite') !== h)) {
         // Full content, verbatim: the user must see exactly what would be sent.
         confirmations.set('calendar-invite', h)
+        let recText = ''
+        if (rec) {
+          recText = '\n周期: ' + rec.type + (rec.interval ? ' x' + rec.interval : '')
+          if (rec.daysOfWeek && rec.daysOfWeek.length) recText += ' on ' + rec.daysOfWeek.join(',')
+          if (rec.count) recText += ', ' + rec.count + '次'
+          else if (rec.until) recText += ', until ' + rec.until
+        }
         return needsConfirmation('calendar-invite',
           '主题: ' + a.subject + '\n时间: ' + a.start + ' ~ ' + a.end
             + (a.location ? '\n地点: ' + a.location : '')
-            + '\n参会人: ' + a.recipients.join('; ') + '（将发出会议邀请）'
+            + (required.length ? '\n必选参会人: ' + required.join('; ') : '')
+            + (optional.length ? '\n可选参会人: ' + optional.join('; ') : '')
+            + (hasRecipients ? '（将发出会议邀请）' : '')
+            + recText
             + (a.body ? '\n\n正文:\n' + String(a.body) : ''),
           ['subject', 'location', 'body'])
       }
-      return olk('calendar_create', a, { confirmed: hasRecipients })
+      return dispatchConfirmed('calendar-invite', 'calendar_create', a, { confirmed: hasRecipients })
     },
     presentCall: (a) => ({ card: 'generic', title: 'Create Outlook calendar entry (asks first)', kind: 'other', rawInput: { subject: a.subject, start: a.start, end: a.end } }),
+  })
+
+  ctx.tools.register({
+    name: 'outlook_meeting_requests',
+    description: 'List meeting requests waiting for your response (invites others sent you, last 30 days), with organizer, proposed time and location. Read-only; respond with outlook_respond_meeting.',
+    parameters: { type: 'object', additionalProperties: true, properties: {} },
+    output: {
+      schema: { type: 'object', additionalProperties: true },
+      render: (_a, v) => [{ type: 'text', text: JSON.stringify(v) }],
+    },
+    async execute() { return olk('meeting_requests') },
+    presentCall: () => ({ card: 'generic', title: 'List Outlook meeting requests', kind: 'other', rawInput: {} }),
+  })
+
+  ctx.tools.register({
+    name: 'outlook_respond_meeting',
+    description: 'Accept, tentatively accept, or decline a meeting request (entryId from outlook_meeting_requests). TWO-CALL CONFIRMATION: the first call returns needs-confirmation; retry with confirmed:true after the user allows. Accepting/declining sends a response to the organizer.',
+    parameters: {
+      type: 'object',
+      additionalProperties: true,
+      properties: {
+        entryId: { type: 'string', description: 'entryId of the meeting request (from outlook_meeting_requests).' },
+        response: { type: 'string', description: '"accept", "tentative", or "decline".' },
+        confirmed: { type: 'boolean', description: 'Set true ONLY after the user approved via an in-session popup.' },
+      },
+      required: ['entryId', 'response'],
+    },
+    output: {
+      schema: { type: 'object', additionalProperties: true },
+      render: (_a, v) => [{ type: 'text', text: JSON.stringify(v) }],
+    },
+    async execute(a) {
+      const h = contentHash({ entryId: a.entryId, response: a.response })
+      if (a.confirmed !== true || confirmations.get('meeting-respond') !== h) {
+        confirmations.set('meeting-respond', h)
+        const label = a.response === 'accept' ? '接受' : a.response === 'tentative' ? '暂定接受' : a.response === 'decline' ? '拒绝' : String(a.response)
+        return needsConfirmation('meeting-respond',
+          '会议响应: ' + label + '\n请求 entryId: ' + a.entryId + '\n（响应将发送给组织者；先用 outlook_meeting_requests 查看详情）')
+      }
+      return dispatchConfirmed('meeting-respond', 'respond_meeting', a, { confirmed: true })
+    },
+    presentCall: (a) => ({ card: 'generic', title: 'Respond to Outlook meeting (asks first)', kind: 'other', rawInput: { entryId: a.entryId, response: a.response } }),
+  })
+
+  ctx.tools.register({
+    name: 'outlook_meeting_update',
+    description: 'Update an existing appointment/meeting on the calendar (entryId from outlook_calendar_query — use the outlook entryId if available). Changed fields are applied; if the meeting has attendees, Outlook re-notifies them. TWO-CALL CONFIRMATION: first call returns needs-confirmation; retry with confirmed:true after the user allows. Applies to personal appointments too (uniform gate).',
+    parameters: {
+      type: 'object',
+      additionalProperties: true,
+      properties: {
+        entryId: { type: 'string', description: 'entryId of the appointment/meeting to update.' },
+        subject: { type: 'string', description: 'New subject (optional).' },
+        start: { type: 'string', description: 'New start, "yyyy-MM-dd HH:mm" (optional).' },
+        end: { type: 'string', description: 'New end, "yyyy-MM-dd HH:mm" (optional).' },
+        location: { type: 'string', description: 'New location (optional).' },
+        body: { type: 'string', description: 'New body (optional).' },
+        confirmed: { type: 'boolean', description: 'Set true ONLY after the user approved; required only when attendees will be notified.' },
+      },
+      required: ['entryId'],
+    },
+    output: {
+      schema: { type: 'object', additionalProperties: true },
+      render: (_a, v) => [{ type: 'text', text: JSON.stringify(v) }],
+    },
+    async execute(a) {
+      const h = contentHash({ entryId: a.entryId, subject: a.subject || '', start: a.start || '', end: a.end || '', location: a.location || '', body: a.body || '' })
+      if (a.confirmed !== true || confirmations.get('meeting-update') !== h) {
+        confirmations.set('meeting-update', h)
+        const changes = []
+        if (a.subject) changes.push('主题→ ' + a.subject)
+        if (a.start) changes.push('开始→ ' + a.start)
+        if (a.end) changes.push('结束→ ' + a.end)
+        if (a.location) changes.push('地点→ ' + a.location)
+        if (a.body) changes.push('正文→ ' + String(a.body).slice(0, 300))
+        if (changes.length === 0) return { status: 'error', error: 'nothing to update: provide at least one changed field.' }
+        return needsConfirmation('meeting-update',
+          '更新会议 entryId: ' + a.entryId + '\n变更:\n- ' + changes.join('\n- ')
+          + '\n（若为多人会议，将自动通知所有参会人）')
+      }
+      return dispatchConfirmed('meeting-update', 'meeting_update', a, { confirmed: true })
+    },
+    presentCall: (a) => ({ card: 'generic', title: 'Update Outlook meeting (asks first)', kind: 'other', rawInput: { entryId: a.entryId } }),
+  })
+
+  ctx.tools.register({
+    name: 'outlook_meeting_cancel',
+    description: 'Cancel a meeting (notifies all attendees with a cancellation) or delete a personal appointment. TWO-CALL CONFIRMATION for both paths: the first call returns needs-confirmation; retry with confirmed:true after the user allows.',
+    parameters: {
+      type: 'object',
+      additionalProperties: true,
+      properties: {
+        entryId: { type: 'string', description: 'entryId of the appointment/meeting to cancel.' },
+        confirmed: { type: 'boolean', description: 'Set true ONLY after the user approved via an in-session popup.' },
+      },
+      required: ['entryId'],
+    },
+    output: {
+      schema: { type: 'object', additionalProperties: true },
+      render: (_a, v) => [{ type: 'text', text: JSON.stringify(v) }],
+    },
+    async execute(a) {
+      const h = contentHash({ entryId: a.entryId })
+      if (a.confirmed !== true || confirmations.get('meeting-cancel') !== h) {
+        confirmations.set('meeting-cancel', h)
+        return needsConfirmation('meeting-cancel',
+          '取消会议 entryId: ' + a.entryId + '\n（若为多人会议，将向所有参会人发出取消通知）')
+      }
+      return dispatchConfirmed('meeting-cancel', 'meeting_cancel', a, { confirmed: true })
+    },
+    presentCall: (a) => ({ card: 'generic', title: 'Cancel Outlook meeting (asks first)', kind: 'other', rawInput: { entryId: a.entryId } }),
   })
 
   ctx.tools.register({
@@ -573,6 +824,8 @@ export function apply(ctx) {
         mode: { type: 'string', description: '"reply" (sender only), "reply-all" (sender + all recipients), or "forward" (new recipient, keeps attachments).' },
         body: { type: 'string', description: 'New text to write above the auto-quoted original.' },
         to: { type: 'string', description: 'Forward recipient(s), semicolon-separated. Required for forward; ignored for reply/reply-all.' },
+        cc: { type: 'string', description: 'Optional Cc recipients, semicolon-separated. Overwrites the reply-all preset when given.' },
+        bcc: { type: 'string', description: 'Optional Bcc recipients, semicolon-separated; hidden from other recipients.' },
         attachments: { type: 'array', items: { type: 'string' }, description: 'Optional extra local file paths to attach (forward already carries the original attachments).' },
         confirmed: { type: 'boolean', description: 'Set true ONLY after the user approved this exact reply via an in-session popup.' },
       },
@@ -585,7 +838,8 @@ export function apply(ctx) {
     async execute(a) {
       const content = {
         entryId: a.entryId, mode: a.mode, body: String(a.body || ''),
-        to: a.to || '', attachments: Array.isArray(a.attachments) ? a.attachments : [],
+        to: a.to || '', cc: a.cc || '', bcc: a.bcc || '',
+        attachments: Array.isArray(a.attachments) ? a.attachments : [],
       }
       const h = contentHash(content)
       if (a.confirmed !== true || confirmations.get('reply-mail') !== h) {
@@ -601,6 +855,8 @@ export function apply(ctx) {
         return needsConfirmation('reply-mail',
           modeText + '\n原邮件: [' + prev.sender + '] ' + prev.subject
           + (a.to && a.mode === 'forward' ? '\n转发收件人: ' + a.to : '')
+          + (a.cc ? '\n抄送: ' + a.cc : '')
+          + (a.bcc ? '\n密送: ' + a.bcc : '')
           + (att.lines ? '\n附加附件: ' + att.lines : '')
           + (a.mode === 'forward' ? '\n（转发自动携带原邮件附件）' : '')
           + '\n\n你的内容:\n' + String(a.body || '')
@@ -608,9 +864,9 @@ export function apply(ctx) {
           + '\nSent: ' + (prev.received || '')
           + '\nTo: ' + prev.to
           + '\nSubject: ' + prev.subject,
-          a.mode === 'forward' ? ['to', 'body'] : ['body'])
+          a.mode === 'forward' ? ['to', 'cc', 'bcc', 'body'] : ['cc', 'bcc', 'body'])
       }
-      return olk('reply_mail', a, { confirmed: true })
+      return dispatchConfirmed('reply-mail', 'reply_mail', a, { confirmed: true })
     },
     presentCall: (a) => ({ card: 'generic', title: 'Reply/forward Outlook mail (asks user first)', kind: 'other', rawInput: { entryId: a.entryId, mode: a.mode, to: a.to } }),
   })
@@ -638,7 +894,7 @@ export function apply(ctx) {
 
   ctx.tools.register({
     name: 'outlook_check_new',
-    description: 'Fetch new-mail arrivals pushed by the Outlook NewMailEx watcher since the last check, as a list (entryId, subject, sender, time). Fetching clears the pending queue and resets the sidebar badge. Returns unread totals too. Read-only.',
+    description: 'Fetch new-mail arrivals pushed by the Outlook NewMailEx watcher since the last check, as a list (entryId, subject, sender, time). Fetching clears the pending queue and resets the sidebar badge. Returns unread totals too. Read-only. Tip: when presenting arrivals to the user, append a clickable open link per mail: [打开](http://127.0.0.1:3080/olk-notify/open?entryId=<entryId>).',
     parameters: {
       type: 'object',
       additionalProperties: true,
@@ -655,5 +911,5 @@ export function apply(ctx) {
     presentCall: () => ({ card: 'generic', title: 'Check new Outlook mail', kind: 'other', rawInput: {} }),
   })
 
-  console.info('[dsh-outlook] registered 13 Outlook COM tools')
+  console.info('[dsh-outlook] registered 18 Outlook COM tools')
 }

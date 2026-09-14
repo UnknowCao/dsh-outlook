@@ -2,6 +2,28 @@
 
 本项目的版本叙事遵循"为什么改"优先于"改了什么"。每条都先给动机。
 
+## 2.10.1 — 公共发布前的移植性加固
+
+**为什么**：插件将面向任意用户的电脑分发，不能假设安装目录可写、Outlook 一定装过、README 永远是最新的。
+
+**改了什么**：
+- watcher 诊断日志从插件安装目录（全局安装可能只读）移到 `%TEMP%\dsh-outlook-watch-debug.log`。
+- 桥在 COM 对象创建前做 HKCR 预检：未装经典 Outlook（或只有 UWP "New Outlook"）时返回可操作的错误信息，而非天书般的 ActiveX 报错。
+- 桥/watcher 调用改为 `Get-Content -Raw -Encoding UTF8`，不再依赖文件 BOM（编辑工具会剥 BOM 的坑已两次复现）。
+- README 刷新到 18 工具/43 用例的现状，补会议四件套与 `outlook_open_mail`，已知边界一节更新（端口假设、OLK_WATCH 开关、日志位置）。
+- `meeting_update`/`meeting_cancel` 工具描述与实际行为对齐（统一两段式确认）。
+
+## 2.10.0 — 会话里点击即打开邮件 + 桥的编码隐患修复
+
+**为什么**：搜索/新邮件结果只给了 entryId，用户想看原文必须自己在 Outlook 里翻——最常用的"看一眼这封邮件"动作反而最绕。同时在实测中暴露：`olk.ps1`/`watch.ps1` 是无 BOM 的 UTF-8，PowerShell 5.1 的 `Get-Content -Raw` 按系统代码页（GBK）解码时中文全乱、整文件解析失败——生产环境只是因系统代码页恰好非 GBK 而侥幸未爆。
+
+**改了什么**：
+- 桥新增 `open_mail` 动作：`GetItemFromID().Display()` 在桌面 Outlook 检查器窗口打开邮件，并显式置 `UnRead=$false`（打开即视为已读，返回 `wasUnread`）。纯本地动作，不离开机器，不走确认门。
+- host 新增 `/olk-notify/open` 路由：GET（`?entryId=`，返回极简 HTML 结果页，供会话聊天里的 markdown 链接点击）+ POST（JSON，供侧边栏弹层）。沿用 sameOrigin 守卫（浏览器导航无 Origin 头，与既有路由同信任级）；entryId 白名单正则（`[A-Za-z0-9+/=_-]{20,512}`）。打开成功后 host 把该 entryId 移出 `notify.pending` 并 `unread--`，角标计数随之减 1。
+- 新工具 `outlook_open_mail`（共 18 个工具）；`outlook_search_mail`/`outlook_check_new` 描述追加"给每封邮件贴可点击打开链接"的提示，agent 展示结果时直接给 `[打开](…/olk-notify/open?entryId=…)` 链接。
+- 侧边栏新邮件弹层每封邮件变为可点击按钮：POST 打开路由，成功后条目立即从列表移除（角标即时减 1，不等 20s 轮询），失败 beacon 上报。
+- `olk.ps1`/`watch.ps1` 前置 UTF-8 BOM，根除 PS5.1 ANSI 误读。
+
 ## 2.6.1 — 让收起侧边栏时角标永远可见
 
 **为什么**：收起态角标探出按钮外沿（top:-4px），会被侧边栏收起动画的裁剪容器切掉或被上方行遮挡——用户看不到新邮件提醒，通知功能在最需要安静的 rail 形态下失效。
