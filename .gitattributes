@@ -1,0 +1,10 @@
+# Normalize line endings across platforms.
+# - Node sources ship as LF (canonical for JS/tooling).
+# - PowerShell scripts are executed via Invoke-Expression after Get-Content;
+#   CRLF keeps Windows PowerShell 5.1 happy in every editor/checkout combo.
+* text=auto eol=lf
+*.ps1 text eol=crlf
+*.psm1 text eol=crlf
+
+# Binaries (badge screenshots)
+*.png binary
