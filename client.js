@@ -49,7 +49,7 @@ window.__ModuleLoader__.load({
         }).catch(() => {})
       } catch { /* never break the UI over a beacon */ }
     }
-    beacon('factory loaded (v2.6.0 slot-based)')
+    beacon('factory loaded (v2.11.0 chat-link interception + slot)')
 
     /**
      * Styles for the row. Includes the same slot-anchor stacking rule
@@ -91,6 +91,10 @@ window.__ModuleLoader__.load({
         '.olk-mailrow{display:block;width:100%;text-align:left;background:0 0;border:none;border-radius:6px;padding:4px 6px;margin:0 -6px;font:inherit;color:inherit;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;transition:background .12s ease}',
         '.olk-mailrow:hover:not(:disabled),.olk-mailrow:focus-visible:not(:disabled){background:var(--dsw-alias-interactive-bg-hover);outline:none}',
         '.olk-mailrow:disabled{cursor:default;opacity:.55}',
+        // Toast shown when a chat markdown link to /olk-notify/open is
+        // intercepted (v2.11.0): the mail opens via same-page POST, so the
+        // user needs some in-page feedback instead of a result tab.
+        '.olk-toast{position:fixed;z-index:70;left:50%;bottom:28px;transform:translateX(-50%);max-width:min(70vw,480px);padding:8px 14px;border-radius:10px;background:var(--dsh-bg-elevated,#fff);color:var(--dsw-alias-label-primary,#222);box-shadow:0 8px 24px rgba(0,0,0,.18);font-size:12.5px;line-height:1.5;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
       ].join('\n')
       document.head.appendChild(style)
       return style
@@ -222,6 +226,67 @@ window.__ModuleLoader__.load({
         popover)
     }
 
+    /**
+     * v2.11.0 — chat-link click interception. A plain left-click on any
+     * anchor whose URL path is /olk-notify/open?entryId=… (regardless of
+     * the port baked into the markdown link — matched by pathname, posted
+     * same-origin) is answered with the very same POST the sidebar popover
+     * uses, so the mail opens in Outlook with NO extra browser tab. Modifier
+     * clicks / middle clicks keep the navigation fallback (the GET result
+     * page). This also repairs the known boundary where a custom-port DSH
+     * deployment made the hardcoded :3080 chat links dead: interception
+     * rewrites them to the page's own origin.
+     */
+    const toastTimers = new Set()
+    const showToast = (text, isError) => {
+      const div = document.createElement('div')
+      div.className = 'olk-toast'
+      div.setAttribute('role', 'status')
+      if (isError) div.style.color = 'var(--dsw-alias-label-danger,#e5484d)'
+      div.textContent = text
+      document.body.appendChild(div)
+      const t = setTimeout(() => {
+        toastTimers.delete(t)
+        if (div.parentNode !== null) div.parentNode.removeChild(div)
+      }, 2600)
+      toastTimers.add(t)
+    }
+
+    const openMailByEntryId = async (entryId) => {
+      try {
+        const res = await fetch('/olk-notify/open', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ entryId: entryId }),
+        })
+        const data = await res.json().catch(() => null)
+        if (data && data.ok) showToast('📨 已在 Outlook 中打开：' + (data.subject || '(无主题)'))
+        else {
+          showToast('⚠️ 打开失败：' + ((data && data.error) || ('HTTP ' + res.status)), true)
+          beacon('chat-link open failed: ' + ((data && data.error) || ('HTTP ' + res.status)))
+        }
+      } catch (e) {
+        showToast('⚠️ 打开失败：' + (e && e.message ? e.message : 'network error'), true)
+        beacon('chat-link open error: ' + (e && e.message))
+      }
+    }
+
+    const interceptChatLink = (ev) => {
+      if (ev.defaultPrevented || ev.button !== 0 || ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey) return
+      const target = ev.target
+      if (target === null || typeof target.closest !== 'function') return
+      const a = target.closest('a[href]')
+      if (a === null) return
+      let u
+      try { u = new URL(a.href, location.href) } catch { return }
+      if (u.pathname !== '/olk-notify/open') return
+      const entryId = u.searchParams.get('entryId')
+      if (entryId === null || entryId === '') return
+      ev.preventDefault()
+      ev.stopPropagation()
+      openMailByEntryId(entryId)
+    }
+
     return {
       name: 'dsh-outlook',
       inject: ['slots'],
@@ -233,6 +298,17 @@ window.__ModuleLoader__.load({
             if (stylesTag.parentNode !== null) stylesTag.parentNode.removeChild(stylesTag)
           }, 'dsh-outlook: styles')
         }
+        // Capture-phase delegation survives React re-renders of the chat
+        // surface; the listener itself lives in this fiber's effect.
+        document.addEventListener('click', interceptChatLink, true)
+        ctx.effect(() => () => {
+          document.removeEventListener('click', interceptChatLink, true)
+          for (const t of toastTimers) clearTimeout(t)
+          toastTimers.clear()
+          for (const div of document.querySelectorAll('.olk-toast')) {
+            if (div.parentNode !== null) div.parentNode.removeChild(div)
+          }
+        }, 'dsh-outlook: chat link interception')
         ctx.slots.inject('sidebar.footer.action', () => ctx.slots.register(
           {
             name: 'sidebar.footer.action',

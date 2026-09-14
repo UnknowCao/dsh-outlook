@@ -1,6 +1,6 @@
 {
   "name": "dsh-outlook",
-  "version": "2.10.1",
+  "version": "2.11.0",
   "description": "Zero-credential Outlook automation for DSH Harness on Windows: the AI agent drives your LOCAL desktop Outlook client via COM — search/read mail, drafts, reply/forward, calendar, address book, rooms, free/busy. No Graph API app registration, no SMTP passwords, no tenant admin rights. Anything that leaves the machine (send mail / meeting invite) passes a three-layer human gate: two-call confirmation + content-hash binding (the confirmed retry must match what the user last saw) + an independent one-time token the bridge demands. A NewMailEx watcher pushes arrivals to a sidebar badge and the outlook_check_new tool.",
   "license": "MIT",
   "type": "module",

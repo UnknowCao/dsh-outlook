@@ -327,51 +327,36 @@ export function apply(ctx) {
         }))
       },
     }), 'dsh-outlook: badge state route')
-    // Click-to-open route: GET serves the chat-surface markdown link
-    // (/olk-notify/open?entryId=... — browser navigation carries no Origin
-    // header, same trust as above); POST serves the sidebar popover. Both
-    // open the mail in a desktop Outlook inspector via the open_mail
-    // bridge action (local window, nothing leaves the machine).
+    // Click-to-open route: POST-only JSON, serving the sidebar popover and
+    // the chat-link click interception (both fetch same-origin). The GET
+    // navigation fallback / result page was REMOVED in v2.11.0 — chat
+    // markdown links still point at this URL because the client intercepts
+    // clicks by pathname; anything that navigates here directly
+    // (modifier/middle click) gets a 405.
     const ENTRY_ID_RE = /^[A-Za-z0-9+/=_-]{20,512}$/
     const readEntryId = (q) => {
       const id = String(q || '')
       return ENTRY_ID_RE.test(id) ? id : null
     }
-    const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]))
-    const openPage = (res, ok, message, subject) => {
-      res.statusCode = ok ? 200 : 500
-      res.setHeader('Content-Type', 'text/html; charset=utf-8')
-      res.end('<!doctype html><meta charset="utf-8"><title>Outlook</title>' +
-        '<body style="font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;color:#222">' +
-        '<div style="text-align:center"><div style="font-size:40px">' + (ok ? '📨' : '⚠️') + '</div>' +
-        '<p>' + esc(message) + (subject ? '<br><b>' + esc(subject) + '</b>' : '') + '</p>' +
-        (ok ? '<p style="opacity:.6">此页面可关闭</p>' : '') + '</div></body>')
-    }
     ctx.effect(() => webCtx.webServer.register({
       kind: 'exact',
       path: '/olk-notify/open',
       handler: async (req, res) => {
-        if (req.method !== 'GET' && req.method !== 'POST') { res.statusCode = 405; res.end(); return }
+        if (req.method !== 'POST') { res.statusCode = 405; res.end(); return }
         if (!sameOrigin(req)) { res.statusCode = 403; res.end(); return }
         let entryId = null
-        let json = false
-        if (req.method === 'GET') {
-          const u = new URL(req.url, 'http://localhost')
-          entryId = readEntryId(u.searchParams.get('entryId'))
-        } else {
-          json = true
-          let body = ''
-          let overflow = false
-          for await (const chunk of req) {
-            body += chunk
-            if (body.length > 8192) { overflow = true; break }
-          }
-          if (overflow) { res.statusCode = 413; res.end(); return }
-          try { entryId = readEntryId(JSON.parse(body).entryId) } catch { entryId = null }
+        let body = ''
+        let overflow = false
+        for await (const chunk of req) {
+          body += chunk
+          if (body.length > 8192) { overflow = true; break }
         }
+        if (overflow) { res.statusCode = 413; res.end(); return }
+        try { entryId = readEntryId(JSON.parse(body).entryId) } catch { entryId = null }
         if (entryId === null) {
-          if (json) { res.statusCode = 400; res.setHeader('Content-Type', 'application/json; charset=utf-8'); res.end(JSON.stringify({ ok: false, error: 'invalid entryId' })) }
-          else openPage(res, false, 'entryId 无效')
+          res.statusCode = 400
+          res.setHeader('Content-Type', 'application/json; charset=utf-8')
+          res.end(JSON.stringify({ ok: false, error: 'invalid entryId' }))
           return
         }
         const r = await olk('open_mail', { entryId })
@@ -384,12 +369,9 @@ export function apply(ctx) {
           if (i >= 0) notify.pending.splice(i, 1)
           if (r.wasUnread && typeof notify.unread === 'number' && notify.unread > 0) notify.unread--
         }
-        if (json) {
-          res.setHeader('Content-Type', 'application/json; charset=utf-8')
-          res.statusCode = r.status === 'ok' ? 200 : 500
-          res.end(JSON.stringify({ ok: r.status === 'ok', subject: r.subject, sender: r.sender, error: r.error }))
-        } else if (r.status === 'ok') openPage(res, true, '已在 Outlook 中打开', r.subject)
-        else openPage(res, false, '打开失败：' + (r.error || 'unknown'))
+        res.setHeader('Content-Type', 'application/json; charset=utf-8')
+        res.statusCode = r.status === 'ok' ? 200 : 500
+        res.end(JSON.stringify({ ok: r.status === 'ok', subject: r.subject, sender: r.sender, error: r.error }))
       },
     }), 'dsh-outlook: open-mail route')
     ctx.effect(() => webCtx.webServer.register({
